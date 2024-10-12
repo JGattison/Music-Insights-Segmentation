@@ -1,0 +1,533 @@
+library(RSelenium)
+library(tidyverse)
+library(netstat)
+library(wdman)
+library(binman)
+library(dplyr)
+library(httr)
+library(jsonlite)
+
+###################### EXTRACT TOP 200 DATA ##################################
+
+# Download web drivers
+selenium()
+
+# Find where drivers are stored
+selenium_object <- selenium(retcommand = T, check = F)
+
+selenium_object
+
+# Set Locale to UTF-8 Encoding
+Sys.setlocale("LC_ALL", "English")
+
+# Start the server
+rs_driver_object <- rsDriver(browser = "chrome",
+                             chromever = "129.0.6668.70",
+                             verbose = FALSE,
+                             port = free_port())
+#class(rs_driver_object)
+
+# Create a client object
+remDr <- rs_driver_object$client
+
+# Open a browser
+remDr$open()
+
+# Navigate to website
+remDr$navigate("https://charts.spotify.com/home")
+
+# Finding elements
+login_object <- remDr$findElement(using = 'link text', 'Log in')
+login_object$getElementAttribute('href')
+login_object$clickElement()
+
+# go back
+#login_object$goBack()
+
+# Log in
+username <- remDr$findElement(using = 'id', 'login-username')
+password <- remDr$findElement(using = 'id', 'login-password')
+login_button <- remDr$findElement(using = 'id', 'login-button')
+
+username$sendKeysToElement(list('lucinothelight@gmail.com'))
+password$sendKeysToElement(list('Jomboeric.1'))
+login_button$clickElement()
+
+
+############################ DATA EXTRACTION ###############################
+
+# Define a function to scrape data for a given date
+scrape_data_for_day <- function(date) {
+  # Ensure the date is properly formatted as a Date object
+  date <- as.Date(date)
+  
+  # Format the date for the URL (Spotify uses the format 'YYYY-MM-DD')
+  date_str <- format(date, "%Y-%m-%d")
+  
+  # Navigate to the Spotify chart page for that day
+  url <- paste0('https://charts.spotify.com/charts/view/regional-us-daily/', date_str)
+  remDr$navigate(url)
+  
+  # Allow some time for the page to load
+  Sys.sleep(5)
+  
+  # Scrape position data
+  wrapper_position <- remDr$findElements(using = "xpath", value = "//div[contains(@class, 'ChartPositionIndicator__PositionIndicator-sc-1d9zs-0 frjmUR')]")
+  positions <- sapply(wrapper_position, function(element) {
+    element$getElementText()[[1]]
+  })
+  
+  # Split the wrapper_texts by "\n"
+  split_texts1 <- strsplit(positions, "\n")
+  
+  # Extract the first part (Title) and second part (Artist(s)) into separate vectors
+  song_position <- sapply(split_texts1, function(x) x[1])      # First part: Position
+  
+  # Scrape song info
+  wrapper_elements <- remDr$findElements(using = "xpath", value = "//div[contains(@class, 'styled__Wrapper-sc-135veyd-14')]")
+  wrapper_texts <- sapply(wrapper_elements, function(element) {
+    element$getElementText()[[1]]
+  })
+  
+  # Split the wrapper_texts by "\n"
+  split_texts2 <- strsplit(wrapper_texts, "\n")
+  
+  # Extract the first part (Title) and second part (Artist(s)) into separate vectors
+  titles <- sapply(split_texts2, function(x) x[1])      # First part: Title
+  artists <- sapply(split_texts2, function(x) x[2])     # Second part: Artist(s)
+  
+  # Scrape additional table info (e.g., peak, prev, streak, streams)
+  table_elements <- remDr$findElements(using = 'xpath', value = "//td[contains(@class, 'TableCell__TableCellElement-sc-1nn7cfv-0 jjVhDD encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK')]")
+  td_texts <- sapply(table_elements, function(element) {
+    element$getElementText()[[1]]
+  })
+  
+  # Reshape the td_texts into a matrix with 3 columns (Peak, Prev, Streak)
+  td_matrix <- matrix(td_texts, ncol = 3, byrow = TRUE)
+  
+  # Convert the matrix into appropriate column names
+  peak = td_matrix[, 1]
+  prev = td_matrix[, 2]
+  streak = td_matrix[, 3]
+  
+  # Scrape streams data
+  stream_elements <- remDr$findElements(using = 'xpath', value = "//td[contains(@class, 'TableCell__TableCellElement-sc-1nn7cfv-0 bdJpYG encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK')]")
+  streams <- sapply(stream_elements, function(element) {
+    element$getElementText()[[1]]
+  })
+  
+  # Combine all data into a single data frame (one row per song)
+  data.frame(
+    Date = date_str,
+    Position = song_position,
+    Title = titles,
+    Artist = artists,
+    Peak = peak,
+    Prev = prev,
+    Streak = streak,
+    Streams = streams,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Create a sequence of dates for the past 3 years
+#start_date <- Sys.Date() - years(3)
+start_date <- as.Date('2024-01-18')
+end_date <- Sys.Date() - 1
+dates <- seq(start_date, end_date, by = "day")
+
+# Initialize an empty data frame to store all the scraped data
+all_data2 <- data.frame()
+
+# Loop over each date and scrape the data
+for (date in dates) {
+  # Scrape the data for the current date
+  day_data <- scrape_data_for_day(date)
+  
+  # Append the day's data to the all_data data frame
+  all_data <- rbind(all_data, day_data)
+  
+  # Optional: print progress
+  print(paste("Scraped data for", date))
+}
+
+
+# Data Validation
+
+#Which dates are missing songs from the charts?
+unique(all_data$Date)[which(table(all_data$Date) < 200)]
+
+#Which position song is missing?
+all_data %>% filter(Date == '2023-03-11') %>%  select(Position)
+
+#Upon checking the charts, this song is missing from the charts, the scraping was done correctly.
+
+
+######################## EXTRACT TRACK FEATURES #############################
+
+# Set Spotify credentials
+client_id <- '2a4d2e77880241779f30fb498b1e9baf'
+client_secret <- 'acfe15236ece421ba9a0a2b9b8620b49'
+
+# Obtain an access token
+RefreshToken <- function(client_id, client_secret){
+  response <- POST(
+    'https://accounts.spotify.com/api/token',
+    accept_json(),
+    authenticate(client_id, client_secret),
+    body = list(grant_type = 'client_credentials'),
+    encode = 'form'
+  )
+  
+  # Extract the access token from the response
+  token <- content(response)$access_token
+  
+  return(token)
+}
+
+# Search for a track ID by title and artist(s)
+get_track_id <- function(title, artist) {
+  # Build the search query
+  query <- paste0('https://api.spotify.com/v1/search?q=', URLencode(paste(title, artist)), '&type=track&limit=1')
+  
+  # Make the request to the Spotify API
+  response <- GET(query, add_headers(Authorization = paste('Bearer', token)))
+  
+  # Parse the response
+  data <- fromJSON(content(response, as = "text", encoding = "UTF-8"))
+  
+  # Check if the track was found
+  if (length(data$tracks$items) > 0) {
+    return(data$tracks$items$id)  # Return the track ID
+  } else {
+    return(NA)  # Return NA if no track was found
+  }
+}
+
+View(data$tracks)
+
+# Check the full response for debugging
+response_content <- content(response, as = "text", encoding = "UTF-8")
+print(response_content)  # See what the API is returning
+
+# Example array of songs with titles and artists
+songs <- all_data %>% 
+  select(Title, Artist) %>% 
+  distinct()
+  
+# Apply the function to each song to find the track IDs
+songs$TrackID <- mapply(get_track_id, songs$Title, songs$Artist)
+
+# Print the final result with track IDs
+print(songs)
+
+# Inspect response headers to check for rate limiting
+headers <- headers(response)
+print(headers)
+
+# Check for duplicated IDs
+dup_songs <- songs %>% 
+  filter(TrackID %in% songs[which(duplicated(songs$TrackID)),3]) %>% 
+    arrange(TrackID)
+
+# Replace duplicated IDs
+dup_songs$TrackID2 = NA
+
+dup_songs[2,4] = "39w2YI59aWcTSzdqana42B"
+dup_songs[3,4] = '5OndtwLGA9O6XHFcGm2H7r'
+dup_songs[6,4] = '0IMUFRaM2W3wKNM1CSQ4Zm'
+dup_songs[7,4] = '0DuylJNqsvjRN9hhWUdeJZ'
+dup_songs[9,4] = '7Lkxvfl2rkNYWS4kBDCQtN'
+dup_songs[11,4] = '2nLOHgzXzwFEpl62zAgCEC'
+dup_songs[14,4] = '0omTAcy4qicTuM8hoVFIkL'
+dup_songs[15,4] = '4v1TTTCadimzZkTuDTnYBc'
+dup_songs[18,4] = '6GmL39a9OazWtyMkAbJz7v'
+dup_songs[19,4] = '6f9GhvtmiQR6JNXRZJKYlj'
+dup_songs[21,4] = '5MaFTsKpVo4VHmzXUIdLrj'
+dup_songs[24,4] = '04t8HpnAGcLaWnBwzVR7H1'
+dup_songs[26,4] = '3MkXV52jXtsG4pvKp4cGE8'
+dup_songs[27,4] = '2th6kLQPb9HzsgTI5VxHNp'
+dup_songs[29,4] = '37BZB0z9T8Xu7U3e65qxFy'
+dup_songs[32,4] = '3sKZHtQoq3tPtkXbT8PJAc'
+dup_songs[34,4] = '1pnDvUuAEd6z8bKEsbAjk1'
+dup_songs[35,4] = '4bXCcoesMt8u99xMsbLr9U'
+dup_songs[37,4] = '7x9aauaA9cu6tyfpHnqDLo'
+dup_songs[39,4] = '4tiWuxeSX1GbeBPt8osI6Z'
+dup_songs[41,4] = '2zfgVd034GlUvk7LqBHl6u'
+dup_songs[43,4] = '6iWMI5oOhWrDbLbjmwTWFq'
+dup_songs[46,4] = '56s4IHGnJVGZYcdOVmC3eb'
+dup_songs[48,4] = '3SWnhRjkg4yYwQLjabs0jY'
+dup_songs[49,4] = '0kzN7YAMSbmlHOvxlbQW9y'
+dup_songs[52,4] = '5fclVBnzaGrbucvVMC228o'
+dup_songs[53,4] = '1B5VzXPqMlvRw0U4HJY3dJ'
+dup_songs[55,4] = '0Vz146N2GxkVJw4kSGXrNi'
+dup_songs[56,4] = '6gcuJpHu0Ey30D5WR76y98'
+dup_songs[58,4] = '0Cz12ejDQ5L1c1f4sVck4n'
+dup_songs[59,4] = '6soQZdONN0ZsQ9hZ6Pkef4'
+dup_songs[60,4] = '1GydGCPNYJnCziQZBLE85q'
+dup_songs[62,4] = '4A2LfnduSTsE8u0ecYROxE'
+dup_songs[64,4] = '7oDd86yk8itslrA9HRP2ki'
+dup_songs[66,4] = '1vjon7jtpF5usLV2CVxtsw'
+dup_songs[70,4] = '1KUZ33cOqk3X4Ezk0aZnVp'
+dup_songs[72,4] = '4LreWoO3cpgiIfrRwbOUSF'
+dup_songs[74,4] = '7GA86Uo2jYbj8vIXe2nyWd'
+dup_songs[77,4] = '2RRYaYHY7fIIdvFlvgb5vq'
+dup_songs[79,4] = '1RlcvK95g0XfRpDvFbGLUO'
+dup_songs[81,4] = '3RjZQijdC0KAXY0MTlbAR4'
+dup_songs[82,4] = '1q3RiD1tIWUpGsNFADMlvl'
+dup_songs[86,4] = '24DefNCFiWTP8OjYWiXuYe'
+dup_songs[88,4] = '5QNW6Vx14N4OfJ7D0eDg0d'
+dup_songs[89,4] = '7kQJCw0ZkvHgfJqRwPblmG'
+dup_songs[91,4] = '3NanY0K4okhIQzL33U5Ad8'
+dup_songs[93,4] = '0lmMtDQ2ElasKU2qDAE6NN'
+dup_songs[95,4] = '6aBxQDozaIOTOZC1LH8M20'
+dup_songs[98,4] = '36UEl3tAYgKAB7kTnO9XDn'
+dup_songs[99,4] = '0KCSJzsQVxkloxoT7dyrqV'
+dup_songs[101,4] = '6wfugRLamFsTRbPcCpNnP7'
+dup_songs[104,4] = '23Lyy7ZXRvzfgH4JtDkKrX'
+dup_songs[106,4] = '1foNLbvX6yP0tMs3eAXspd'
+
+songs2 = data.frame()
+
+songs2 <- songs %>% 
+  left_join(dup_songs, by = c('Title', 'Artist', 'TrackID')) %>% 
+  mutate(TrackID = ifelse(is.na(TrackID2), TrackID, TrackID2)) %>% 
+  select(Title, Artist, TrackID)
+
+# Add Track IDs to all_data
+
+all_data2 <- all_data %>% 
+  left_join(songs2, by = c('Title', 'Artist'))
+
+# Find track features (Release date, album_type, explicit)
+
+TrackID = songs2$TrackID[1]
+
+GetTrackData <- function(client_id, client_secret, TrackIDs){
+  # Make a GET request to the track endpoint to get the album ID
+  track_url <- paste0('https://api.spotify.com/v1/tracks?ids=',TrackIDs)
+  
+  # Get track details
+  track_response <- GET(track_url,  add_headers(Authorization = paste('Bearer', token)))
+  
+  # Check if the request was successful
+  if(status_code(track_response) != 200){
+    if(status_code(track_response) == 401){
+      cat('Access token has expired. Refreshing token...')
+      
+      # Refresh token
+      token <- RefreshToken(client_id, client_secret)
+      
+      track_response <- GET(track_url,  add_headers(Authorization = paste('Bearer', token)))
+    }
+    else if(status_code(track_response) == 429){
+      cat('Rate limit reached. Waiting...')
+      Sys.sleep(90)
+      
+      track_response <- GET(track_url,  add_headers(Authorization = paste('Bearer', token)))
+    }else(
+      stop(paste0('Failed to fetch results. Status code:',status_code(track_response), ' TrackID:', TrackID))
+      )
+  }
+    
+  # Parse the track response
+  track_data <- fromJSON(content(track_response, as = "text", encoding = 'UTF-8'))
+  
+  TrackIDs <- unlist(strsplit(TrackIDs, split = ","))
+  
+  # Extract data
+  results <- data.frame(
+    TrackIDs = TrackIDs,
+    album_type = track_data$tracks$album$album_type,
+    release_date = track_data$tracks$album$release_date,
+    explicit = track_data$tracks$explicit,
+    stringsAsFactors = FALSE
+  )
+  
+  return(results)
+}
+
+# Get track features (
+#    Acousticness,
+#    Danceability,
+#    Duration_ms,
+#    Energy,
+#    Instrumentalness,
+#    Key,
+#    Liveness,
+#    Loudness,
+#    Mode,
+#    Speechiness,
+#    Tempo,
+#    Time Signature,
+#    Valence)
+
+GetTrackFeatures <- function(client_id, client_secret, TrackIDs){
+  track_url <- paste0('https://api.spotify.com/v1/audio-features?ids=', TrackIDs)
+  
+  track_response <- GET(track_url, add_headers(Authorization = paste('Bearer', token)))
+  
+  # Check if the request was successful
+  if(status_code(track_response) != 200){
+    if(status_code(track_response) == 401){
+      cat('Access token has expired. Refreshing token...')
+      
+      # Refresh token
+      token <- RefreshToken(client_id, client_secret)
+      Sys.sleep(90)
+      
+      track_response <- GET(track_url,  add_headers(Authorization = paste('Bearer', token)))
+    }
+    else if(status_code(track_response) == 429){
+      cat('Rate limit reached. Waiting...')
+      Sys.sleep(90)
+      
+      track_response <- GET(track_url,  add_headers(Authorization = paste('Bearer', token)))
+    }else(
+      stop(paste0('Failed to fetch results. Status code:',status_code(track_response), ' TrackID:', TrackID))
+    )
+  }
+  
+  track_data <- fromJSON(content(track_response, as = 'text', encoding = 'UTF-8'))
+
+  results <- data.frame(
+    acousticness =  track_data$audio_features$acousticness,
+    danceability =  track_data$audio_features$danceability,
+    duration_ms = track_data$audio_features$duration_ms,
+    energy = track_data$audio_features$energy,
+    instrumentalness = track_data$audio_features$instrumentalness,
+    key = track_data$audio_features$key,
+    liveness = track_data$audio_features$liveness,
+    loudness = track_data$audio_features$loudness,
+    mode = track_data$audio_features$mode,
+    speechiness = track_data$audio_features$speechiness,
+    tempo = track_data$audio_features$tempo,
+    time_signature = track_data$audio_features$time_signature,
+    valence = track_data$audio_features$valence,
+    stringsAsFactors = FALSE
+  )
+  
+  return(results)
+}
+
+# Initialize an empty data frame to store all the scraped data
+all_track_features <- data.frame()
+nums = seq.int(101,4001,by=100)
+
+for(n in nums){
+  if(n+99 > nrow(songs2)){
+    indexes <- c(4001:nrow(songs2))
+  }else{
+    indexes <- c(n:(n+99))
+  }
+  TrackIDs <- songs2$TrackID[indexes]
+  TrackIDs <- paste(TrackIDs,collapse =  ',')
+  
+  #track_data <- GetTrackData(client_id, client_secret, TrackIDs)
+  track_features <- GetTrackFeatures(client_id, client_secret, TrackIDs)
+  
+  track_results <- track_features
+  
+  all_track_features <- rbind(all_track_features, track_results)
+}
+
+all_track_data <- rbind(all_track_data, all_track_data2)
+
+all_track_data2 <- cbind(all_track_data, all_track_features)
+
+colnames(all_track_data2)[1] = "TrackID"
+
+all_track_data3 <- all_track_data2 %>% 
+  distinct()
+
+final_data <- all_data2 %>% 
+  left_join(all_track_data3, by = 'TrackID')
+
+summary(final_data)
+
+write.csv(final_data, 'Spotify Top 200 w features.csv')
+
+
+###### TESTING ZONE #######
+
+# Scroll to the end of the webpage
+# remDr$executeScript('window.scrollTo(0, document.body.scrollHeight);')
+
+# Navigate to Daily songs webpage
+remDr$navigate('https://charts.spotify.com/charts/view/regional-us-daily/2024-09-25')
+
+# Identify data
+# Find all the wrapper divs for the position info
+wrapper_position <- remDr$findElements(using = "xpath", value = "//div[contains(@class, 'ChartPositionIndicator__PositionIndicator-sc-1d9zs-0 frjmUR')]")
+
+# Extract the text from each wrapper div
+positions <- sapply(wrapper_position, function(element) {
+  element$getElementText()[[1]]  # Extract the text content from the wrapper
+})
+
+#positions
+
+# Find all the wrapper divs for the song info
+wrapper_elements <- remDr$findElements(using = "xpath", value = "//div[contains(@class, 'styled__Wrapper-sc-135veyd-14')]")
+
+# Extract the text from each wrapper div
+wrapper_texts <- sapply(wrapper_elements, function(element) {
+  element$getElementText()[[1]]  # Extract the text content from the wrapper
+})
+
+#wrapper_texts
+
+# Remaining info?
+table_elements <- remDr$findElements(using = 'xpath', value = "//td[contains(@class, 'TableCell__TableCellElement-sc-1nn7cfv-0 jjVhDD encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK')]")
+
+td_texts <- sapply(table_elements, function(element) {
+  element$getElementText()[[1]]  # Extract the text content from the <td>
+})
+
+#td_texts
+
+# Streams
+stream_elements <- remDr$findElements(using = 'xpath', value = "//td[contains(@class, 'TableCell__TableCellElement-sc-1nn7cfv-0 bdJpYG encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK')]")
+
+streams <- sapply(stream_elements, function(element) {
+  element$getElementText()[[1]]  # Extract the text content from the <td>
+})
+
+#streams
+
+
+
+
+
+
+
+
+
+<td class="TableCell__TableCellElement-sc-1nn7cfv-0 bdJpYG encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK" data-encore-id="tableCell">1,237,410</td>
+
+# Adjust the XPath to capture all the required <td> elements
+td_elements <- remDr$findElements(using = "xpath", value = "//td[contains(@class, 'TableCell__TableCellElement')]")
+
+
+
+<td class="TableCell__TableCellElement-sc-1nn7cfv-0 jjVhDD encore-text-body-small styled__RightTableCell-sc-135veyd-4 kGfYTK" data-encore-id="tableCell"><span>1</span></td>
+
+<div class="ChartPositionIndicator__PositionIndicator-sc-1d9zs-0 frjmUR"><span class="encore-text encore-text-marginal-bold encore-internal-color-text-base" data-encore-id="text" aria-label="Current position">1</span><div aria-label="Chart position no change" class="ChartPositionIndicator__MovementBadge-sc-1d9zs-1 cxkSMq"><span class="encore-text encore-text-marginal-bold" data-encore-id="text">&nbsp;–&nbsp;</span></div></div>
+
+
+wrapper_elements <- remDr$findElements(using = "xpath", value = "//div[contains(@class, 'styled__Wrapper-sc-135veyd-14')]")
+
+# Extract the text from each wrapper div
+wrapper_texts <- sapply(wrapper_elements, function(element) {
+  element$getElementText()[[1]]  # Extract the text content from the wrapper
+})
+
+wrapper_texts
+
+
+artist_elements <- remDr$findElements(using = "xpath", value = "//p[@class='encore-text encore-text-body-small']")
+artist_elements$getElementText()
+
+
+# Print the final list of artists for all songs
+print(artist_list)
